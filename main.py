@@ -16,7 +16,7 @@ import json
 app = FastAPI(
     title="Cardiac Readmission Risk API",
     description="AI-powered cardiac readmission prediction with SHAP explainability",
-    version="1.0.0"
+    version="1.1.0"
 )
 
 # Enable CORS (so Bolt.new frontend can connect)
@@ -65,20 +65,100 @@ except Exception as e:
 # HELPER FUNCTIONS
 # ============================================================================
 
+def extract_patient_metadata(df):
+    """Extract patient metadata (ID, name, age, gender, diagnosis) before preprocessing"""
+    
+    metadata = []
+    
+    # Clean column names for matching
+    df_cols = df.columns.str.strip().str.lower().str.replace(' ', '_')
+    col_mapping = {clean: orig for clean, orig in zip(df_cols, df.columns)}
+    
+    for i in range(len(df)):
+        patient_meta = {
+            'patient_id': None,
+            'patient_name': None,
+            'age': None,
+            'gender': None,
+            'primary_diagnosis': None
+        }
+        
+        # Extract Patient ID
+        for col_pattern in ['patient_id', 'paitient_id', 'patientid', 'patient id', 'paitient id']:
+            matching_cols = [orig for clean, orig in col_mapping.items() if col_pattern in clean]
+            if matching_cols:
+                patient_meta['patient_id'] = str(df.iloc[i][matching_cols[0]])
+                break
+        
+        # Extract Patient Name
+        for col_pattern in ['patient_name', 'patientname', 'patient name', 'name']:
+            matching_cols = [orig for clean, orig in col_mapping.items() if col_pattern in clean and 'user' not in clean]
+            if matching_cols:
+                val = df.iloc[i][matching_cols[0]]
+                if pd.notna(val):
+                    patient_meta['patient_name'] = str(val)
+                break
+        
+        # Extract Age
+        for col_pattern in ['age']:
+            matching_cols = [orig for clean, orig in col_mapping.items() if clean == col_pattern or clean.endswith('_age')]
+            if matching_cols:
+                val = df.iloc[i][matching_cols[0]]
+                if pd.notna(val):
+                    try:
+                        patient_meta['age'] = int(float(val))
+                    except:
+                        pass
+                break
+        
+        # Extract Gender
+        for col_pattern in ['gender', 'sex']:
+            matching_cols = [orig for clean, orig in col_mapping.items() if col_pattern in clean]
+            if matching_cols:
+                val = df.iloc[i][matching_cols[0]]
+                if pd.notna(val):
+                    patient_meta['gender'] = str(val)
+                break
+        
+        # Extract Primary Diagnosis
+        for col_pattern in ['primary_diagnosis', 'diagnosis', 'primary diagnosis']:
+            matching_cols = [orig for clean, orig in col_mapping.items() if col_pattern in clean.replace('_', ' ') or col_pattern in clean]
+            if matching_cols:
+                val = df.iloc[i][matching_cols[0]]
+                if pd.notna(val):
+                    patient_meta['primary_diagnosis'] = str(val)
+                break
+        
+        # Fallback: generate ID if not found
+        if patient_meta['patient_id'] is None:
+            patient_meta['patient_id'] = str(i + 1)
+        
+        # Fallback: generate name if not found
+        if patient_meta['patient_name'] is None:
+            patient_meta['patient_name'] = f"Patient {patient_meta['patient_id']}"
+        
+        metadata.append(patient_meta)
+    
+    return metadata
+
+
 def preprocess_data(df):
     """Preprocess uploaded data to match training format"""
     
     # Clean column names
     df.columns = df.columns.str.strip().str.replace(' ', '_').str.replace('/', '_')
     
-    # Drop unnecessary columns
+    # Drop unnecessary columns (including metadata columns we already extracted)
     cols_to_drop = [
-        'paitient_ID', 
+        'paitient_ID',
+        'Patient_ID', 
+        'Patient_Name',
         'Date_of_admission', 
         'Date_of_discharge',
         'High_risk_flag',
         'Risk_score_(0-10)',
-        'Readmiited_within_30_days'  # Remove target if present
+        'Readmiited_within_30_days',
+        'Readmitted_within_30_days'
     ]
     
     cols_to_drop = [col for col in cols_to_drop if col in df.columns]
@@ -87,12 +167,12 @@ def preprocess_data(df):
     # Encode categorical variables
     categorical_cols = df.select_dtypes(include=['object']).columns.tolist()
     
-    binary_map = {'Y': 1, 'y': 1, 'N': 0, 'n': 0}
+    binary_map = {'Y': 1, 'y': 1, 'N': 0, 'n': 0, 'Yes': 1, 'yes': 1, 'No': 0, 'no': 0}
     
     for col in categorical_cols:
         unique_vals = df[col].unique()
         
-        if len(unique_vals) <= 2 and any(val in ['Y', 'y', 'N', 'n'] for val in unique_vals if pd.notna(val)):
+        if len(unique_vals) <= 2 and any(val in ['Y', 'y', 'N', 'n', 'Yes', 'No'] for val in unique_vals if pd.notna(val)):
             df[col] = df[col].map(binary_map)
         else:
             from sklearn.preprocessing import LabelEncoder
@@ -114,6 +194,7 @@ def preprocess_data(df):
     df = df[EXPECTED_FEATURES]
     
     return df
+
 
 def generate_patient_explanation(patient_idx, shap_values, features):
     """Generate human-readable explanation for a patient"""
@@ -159,7 +240,7 @@ def read_root():
     return {
         "status": "healthy",
         "message": "Cardiac Readmission Risk API is running",
-        "version": "1.0.0",
+        "version": "1.1.0",
         "model_loaded": True,
         "shap_enabled": True
     }
@@ -202,6 +283,7 @@ async def predict_readmission(file: UploadFile = File(...)):
             df = pd.read_excel(BytesIO(contents))
         
         print(f"📊 Received file with {df.shape[0]} patients, {df.shape[1]} columns")
+        print(f"📋 Columns: {df.columns.tolist()}")
         
         # Validate data size
         if df.shape[0] > 10000:
@@ -216,13 +298,11 @@ async def predict_readmission(file: UploadFile = File(...)):
                 detail="File is empty. Please upload a file with patient data."
             )
         
-        # Store original patient IDs if present
-        patient_ids = None
-        if 'paitient ID' in df.columns or 'paitient_ID' in df.columns:
-            id_col = 'paitient ID' if 'paitient ID' in df.columns else 'paitient_ID'
-            patient_ids = df[id_col].tolist()
+        # Extract patient metadata BEFORE preprocessing
+        print("📝 Extracting patient metadata...")
+        patient_metadata = extract_patient_metadata(df)
         
-        # Preprocess data
+        # Preprocess data for model
         df_processed = preprocess_data(df.copy())
         
         print(f"✅ Preprocessed to {df_processed.shape[0]} patients, {df_processed.shape[1]} features")
@@ -241,10 +321,16 @@ async def predict_readmission(file: UploadFile = File(...)):
         # Generate results for each patient
         results = []
         for i in range(len(df_processed)):
+            meta = patient_metadata[i]
+            
             patient_result = {
-                'patient_id': patient_ids[i] if patient_ids else i + 1,
+                'patient_id': meta['patient_id'],
+                'patient_name': meta['patient_name'],
+                'age': meta['age'],
+                'gender': meta['gender'],
+                'primary_diagnosis': meta['primary_diagnosis'],
                 'risk_prediction': int(predictions[i]),
-                'risk_probability': float(prediction_proba[i]),
+                'risk_probability': float(prediction_proba[i]) * 100,  # Convert to percentage
                 'risk_level': 'High' if predictions[i] == 1 else 'Low',
                 'explanation': generate_patient_explanation(i, shap_values, df_processed)
             }
@@ -259,7 +345,7 @@ async def predict_readmission(file: UploadFile = File(...)):
             'high_risk_count': high_risk_count,
             'low_risk_count': low_risk_count,
             'high_risk_percentage': float((high_risk_count / len(df_processed)) * 100),
-            'average_risk_probability': float(prediction_proba.mean())
+            'average_risk_probability': float(prediction_proba.mean()) * 100  # Convert to percentage
         }
         
         # Feature importance (top 10)
@@ -286,6 +372,8 @@ async def predict_readmission(file: UploadFile = File(...)):
         raise
     except Exception as e:
         print(f"❌ Error during prediction: {str(e)}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Prediction error: {str(e)}")
 
 @app.get("/api/features")
@@ -302,7 +390,7 @@ def get_expected_features():
 if __name__ == "__main__":
     import uvicorn
     print("\n" + "="*80)
-    print("🚀 Starting Cardiac Readmission Risk API Server")
+    print("🚀 Starting Cardiac Readmission Risk API Server v1.1.0")
     print("="*80)
     print("\n📍 Server will be available at: http://localhost:8000")
     print("📍 API docs: http://localhost:8000/docs")
